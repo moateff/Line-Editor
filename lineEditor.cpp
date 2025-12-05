@@ -1,43 +1,106 @@
 #include <stdio.h>
 #include <iostream>
-#include <conio.h>
-#include <windows.h>
+
+using namespace std;
 
 #define KEY_NULL        0
 #define KEY_ESCAPE      27
 #define KEY_ENTER       13
-#define KEY_BACKSPACE   8
-#define KEY_ARROW_LEFT  75
-#define KEY_ARROW_RIGHT 77
-#define KEY_DELETE      83
-#define KEY_HOME        71
-#define KEY_END         79
+#define KEY_BACKSPACE   127
 
-using namespace std;
+#define KEY_ARROW_LEFT  1000
+#define KEY_ARROW_RIGHT 1001
+#define KEY_HOME        1002
+#define KEY_END         1003
+#define KEY_DELETE      1004
 
-void enableANSI() {
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD dwMode = 0;
-    GetConsoleMode(hOut, &dwMode);
-    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    SetConsoleMode(hOut, dwMode);
+#if defined(_WIN32)
+    #include <conio.h>
+
+    int readKeyRaw() { return _getch(); }
+
+#else
+    #include <termios.h>
+    #include <unistd.h>
+
+    void enableRawMode() {
+        termios term;
+        tcgetattr(STDIN_FILENO, &term);
+        termios raw = term;
+        raw.c_lflag &= ~(ICANON | ECHO);
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    }
+
+    void disableRawMode() {
+        termios term;
+        tcgetattr(STDIN_FILENO, &term);
+        term.c_lflag |= (ICANON | ECHO);
+        tcsetattr(STDIN_FILENO, TCSANOW, &term);
+    }
+
+    int readKeyRaw() {
+        char c = 0;
+        read(STDIN_FILENO, &c, 1);
+        return c;
+    }
+#endif
+
+int readKey() {
+    int c = readKeyRaw();
+
+#if defined(_WIN32)
+    // Windows extended keys
+    if (c == 0 || c == 224) {
+        int k = readKeyRaw();
+        switch (k) {
+            case 75: return KEY_ARROW_LEFT;
+            case 77: return KEY_ARROW_RIGHT;
+            case 71: return KEY_HOME;
+            case 79: return KEY_END;
+            case 83: return KEY_DELETE;
+            default: return KEY_NULL;
+        }
+    }
+
+    if (c == 27) return KEY_ESCAPE;
+    if (c == 13) return KEY_ENTER;       // Windows ENTER
+    if (c == 8)  return KEY_BACKSPACE;   // Windows BACKSPACE
+    return c;
+
+#else
+    // Linux escape sequences
+    if (c == 27) {
+        char seq[3];
+        if (read(STDIN_FILENO, &seq[0], 1) <= 0) return KEY_ESCAPE;
+        if (read(STDIN_FILENO, &seq[1], 1) <= 0) return KEY_ESCAPE;
+
+        if (seq[0] == '[') {
+            switch (seq[1]) {
+                case 'D': return KEY_ARROW_LEFT;
+                case 'C': return KEY_ARROW_RIGHT;
+                case 'H': return KEY_HOME;
+                case 'F': return KEY_END;
+                case '3': { char x; read(STDIN_FILENO, &x, 1); return KEY_DELETE; }
+            }
+        }
+        return KEY_ESCAPE;
+    }
+
+    if (c == '\n') return KEY_ENTER;       // Linux ENTER (LF = 10)
+    if (c == 127)  return KEY_BACKSPACE;   // Linux BACKSPACE
+    return c;
+#endif
 }
 
+
 void clearScreen() {
-    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    DWORD count, cellCount;
-    COORD homeCoords = {0, 0};
+    cout << "\033[2J\033[H";
+}
 
-    if (hConsole == INVALID_HANDLE_VALUE) return;
-
-    if (!GetConsoleScreenBufferInfo(hConsole, &csbi)) return;
-    cellCount = csbi.dwSize.X * csbi.dwSize.Y;
-
-    FillConsoleOutputCharacter(hConsole, (TCHAR)' ', cellCount, homeCoords, &count);
-    FillConsoleOutputAttribute(hConsole, csbi.wAttributes, cellCount, homeCoords, &count);
-
-    SetConsoleCursorPosition(hConsole, homeCoords);
+void enableANSI() {
+#if defined(_WIN32)
+    system(" "); // enables ANSI on modern terminals
+#endif
 }
 
 struct LineEditor {
@@ -168,33 +231,14 @@ void endKey(LineEditor* editor){
     editor->cursor = editor->length;
     cout << "\033[" << (editor->y + 1) << ";" << (editor->x + editor->cursor + 1) << "H";
 }
-int readKey() {
-    int key = _getch();
-
-    if (key == -32) { // special keys prefix
-        key = _getch();
-        switch (key) {
-            case 75: return KEY_ARROW_LEFT;  // Left arrow
-            case 77: return KEY_ARROW_RIGHT; // Right arrow
-            case 71: return KEY_HOME;        // Home
-            case 79: return KEY_END;         // End
-            case 83: return KEY_DELETE;      // Delete
-            default: return KEY_NULL;
-        }
-    } else if (key == KEY_ESCAPE) {
-        return KEY_ESCAPE; // Escape
-    } else if (key == 13) {
-        return KEY_ENTER;  // Enter
-    } else if (key == 8) {
-        return KEY_BACKSPACE;          // Backspace
-    } else {
-        return key;        // normal key
-    }
-}
 
 char* lineEditor(int x, int y, int capacity, char startRange, char endRange) {
     LineEditor editor;
-    initEditor(&editor, x, y);
+    initEditor(&editor, x, y, capacity);
+
+#if !defined(_WIN32)
+    enableRawMode();
+#endif
 
     while (true) {
         int key = readKey();
@@ -205,12 +249,16 @@ char* lineEditor(int x, int y, int capacity, char startRange, char endRange) {
             case KEY_END: endKey(&editor); break;
             case KEY_DELETE: deleteKey(&editor); break;
             case KEY_BACKSPACE: backspaceKey(&editor); break;
-            case KEY_ENTER: /* finish editing */ break;
-            case KEY_ESCAPE: editor.buffer[0] = '\0'; break;
+            case KEY_ENTER: /* finish editing */ goto exit_editor;
+            case KEY_ESCAPE: editor.buffer[0] = '\0'; goto exit_editor;
             default: if((key >= startRange && key <= endRange)) insertKey(&editor, (char)key);
         }
-        if (key == KEY_ENTER || key == KEY_ESCAPE) break;
     }
+
+exit_editor:
+#if !defined(_WIN32)
+    disableRawMode();
+#endif
 
     return editor.buffer;
 }
